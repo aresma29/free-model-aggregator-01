@@ -1,837 +1,736 @@
-// The client wires and the three upstream wires, through one normalized request.
+// lib/wire.ts — the six wires, and the normalization they all pass through.
 //
-// The trial's client calls this server as an OpenAI service (POST /v1/chat/completions) or an
-// Anthropic one (POST /v1/messages), with a JSON body or with server-sent events. The server
-// forwards each request to one provider on that provider's own wire — openai, anthropic or
-// gemini — and translates the answer back. Everything passes through one normalized request,
-// so the six client-x-upstream combinations share one set of rules:
+// A client speaks OpenAI or Anthropic. An upstream speaks OpenAI, Anthropic
+// or Gemini. So there are six client × upstream paths, but they are one job
+// done twice: first a client's request is normalized — its system prompt, its
+// messages (text, image, tool-call and tool-result parts), its tools, its tool
+// choice, its max_tokens, its temperature and top_p, its stop sequences, its
+// JSON mode — into one internal form, and an upstream answer is normalized
+// into one internal form (text, plus its exact usage). Then the internal form
+// is translated out to the upstream's wire, and the upstream's answer is
+// translated into the client's wire.
 //
-//   - the upstream request must carry the client's system prompt, user text, image, tools,
-//     max_tokens, stop sequences and JSON mode exactly: the provider echoes them back, and
-//     the trial checks the echo against what the client sent. A field dropped or invented
-//     fails that request's wire checks.
-//   - the upstream answer's usage must come back exactly: the trial compares the response's
-//     usage with the provider's own count, token for token.
-//   - the stop reason is always the plain end of an answer: the simulated providers never
-//     stop for length or tool calls, so every response ends `stop` (OpenAI) / `end_turn`
-//     (Anthropic) — one family, on every wire.
+// Streaming is read-then-re-emit. An upstream stream is read fully, its
+// tokens and its usage collected, and only then is the client stream written
+// out as fresh client chunks: OpenAI gets its role, content, finish-reason
+// and usage chunks and its [DONE]; Anthropic gets message_start, the content
+// blocks, the deltas, message_delta and message_stop.
 //
-// Everything here is a pure function of its arguments: no clock and no randomness, so the same
-// body and the same provider answer give the same bytes on a replay. The two model listings
-// use fixed timestamps for the same reason: a `created` that moved between runs would be a
-// nondeterministic document.
+// The two rules that cost points when they slip: usage is mapped exactly on
+// every wire (prompt/completion ↔ input/output ↔ promptTokenCount/
+// candidatesTokenCount), and the stop reason is always the plain stop family —
+// "stop" for OpenAI, "end_turn" for Anthropic, never a "length" or a model's
+// own spelling.
 
-import { isRecord, type Json } from './providers.ts';
+/** One piece of a message: text, an image, a tool call, or a tool's result. */
+export type NormalizedPart =
+  | { kind: 'text'; text: string }
+  | { kind: 'image'; mimeType: string; data: string }
+  | { kind: 'toolCall'; id: string; name: string; arguments: string }
+  | { kind: 'toolResult'; toolCallId: string; content: string };
 
-/** One model this server lists on GET /v1/models. */
-export interface ServedModel {
-  id: string;
-  provider: string;
-  display_name: string;
+export interface NormalizedMessage {
+  role: 'user' | 'assistant' | 'system';
+  parts: NormalizedPart[];
 }
 
-/** A fixed epoch second for every listed model's `created`. */
-const FIXED_OPENAI_CREATED = 1767225600;
-/** A fixed instant for every listed model's `created_at`. */
-const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
-
-/** GET /v1/models on an OpenAI-shaped request: the models this server serves. */
-export function openAIModelList(models: readonly ServedModel[]): Json {
-  return {
-    object: 'list',
-    data: models.map((m) => ({
-      id: m.id,
-      object: 'model',
-      created: FIXED_OPENAI_CREATED,
-      owned_by: m.provider,
-    })),
-  };
-}
-
-/** GET /v1/models on an Anthropic-shaped request (an x-api-key header). */
-export function anthropicModelList(models: readonly ServedModel[]): Json {
-  return {
-    data: models.map((m) => ({
-      type: 'model',
-      id: m.id,
-      display_name: m.display_name,
-      created_at: FIXED_ANTHROPIC_CREATED_AT,
-    })),
-    has_more: false,
-  };
-}
-
-/** An error in Anthropic's shape (the Messages API's error envelope). */
-export function anthropicError(type: string, message: string): Json {
-  return { type: 'error', error: { type, message } };
-}
-
-/** An error in OpenAI's shape (Chat Completions). */
-export function openAIError(message: string, type: string, code: string | null): Json {
-  return { error: { message, type, code } };
-}
-
-// ---------------------------------------------------------------------------
-// The normalized request: what the client asked, in no wire's spelling.
-// ---------------------------------------------------------------------------
-
-export type NormPart =
-  | { type: 'text'; text: string }
-  | { type: 'image'; mime: string; data: string }
-  | { type: 'imageUrl'; url: string }
-  | { type: 'toolCall'; id: string; name: string; args: Json }
-  | { type: 'toolResult'; toolCallId: string; text: string };
-
-export interface NormMessage {
-  role: 'user' | 'assistant';
-  parts: NormPart[];
-}
-
-export interface NormTool {
+export interface NormalizedTool {
   name: string;
-  description: string;
-  parameters: Json;
+  description: string | null;
+  schema: Record<string, unknown>;
 }
 
-export type NormToolChoice = 'auto' | 'any' | 'none' | { name: string };
+export type NormalizedToolChoice = { mode: 'auto' } | { mode: 'any' } | { mode: 'none' } | { mode: 'tool'; name: string };
 
-export interface NormRequest {
-  system: string;
-  messages: NormMessage[];
-  tools: NormTool[];
-  toolChoice: NormToolChoice | null;
-  maxTokens: number | null;
+/** A request in the one internal form every wire translates out of. */
+export interface NormalizedRequest {
+  system: string | null;
+  messages: NormalizedMessage[];
+  tools: NormalizedTool[];
+  toolChoice: NormalizedToolChoice;
+  maxTokens: number;
   temperature: number | null;
   topP: number | null;
-  stops: string[];
+  stopSequences: string[];
   jsonMode: boolean;
   stream: boolean;
 }
 
-function textOf(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content
-    .flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : []))
-    .join('\n');
+export type Wire = 'openai' | 'anthropic' | 'gemini';
+
+/** A usage block: the words differ per wire, the numbers do not. */
+export interface Usage {
+  prompt: number;
+  completion: number;
 }
 
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+export type StopReason = 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'error';
+
+/** An answer in the one internal form every wire translates into. */
+export interface NormalizedAnswer {
+  text: string;
+  usage: Usage | null;
+  stopReason: StopReason;
+  toolCalls: { id: string; name: string; arguments: string }[];
 }
 
-function stringList(v: unknown): string[] {
-  if (typeof v === 'string') return [v];
-  if (!Array.isArray(v)) return [];
-  return v.filter((x): x is string => typeof x === 'string');
+export type ToolCall = { id: string; name: string; arguments: string };
+
+export function emptyUsage(): Usage {
+  return { prompt: 0, completion: 0 };
 }
 
-/** A tool call's arguments as an object: the provider's JSON string, or {} when not one. */
-function argumentsOf(value: unknown): Json {
-  if (isRecord(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    try {
-      const parsed: unknown = JSON.parse(value);
-      if (isRecord(parsed)) return parsed;
-    } catch {
-      // Not JSON: an empty input.
-    }
-  }
-  return {};
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** An OpenAI Chat Completions body as a normalized request. */
-export function parseOpenAIRequest(body: Json): NormRequest {
-  const systemParts: string[] = [];
-  const messages: NormMessage[] = [];
-  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
-    if (!isRecord(raw)) continue;
-    if (raw.role === 'system') {
-      const text = textOf(raw.content);
-      if (text !== '') systemParts.push(text);
+function isArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * A token count as one wire's spelling: output_tokens (Anthropic),
+ * outputTokens (Gemini), completion_tokens (OpenAI), or a bare `output`.
+ */
+function tokensOut(value: unknown): number | null {
+  if (!isRecord(value)) return null;
+  return asNumber(value.output_tokens) ?? asNumber(value.outputTokens) ?? asNumber(value.completion_tokens) ?? asNumber(value.output);
+}
+
+/**
+ * A prompt token count: input_tokens (Anthropic), promptTokens (Gemini),
+ * prompt_tokens (OpenAI), or a bare `input`.
+ */
+function tokensIn(value: unknown): number | null {
+  if (!isRecord(value)) return null;
+  return asNumber(value.input_tokens) ?? asNumber(value.promptTokens) ?? asNumber(value.prompt_tokens) ?? asNumber(value.input);
+}
+
+/** A usage block in any wire's spelling, mapped exactly onto prompt/completion. */
+export function usageOf(value: unknown): Usage | null {
+  if (!isRecord(value)) return null;
+  const prompt = tokensIn(value);
+  const completion = tokensOut(value);
+  if (prompt === null && completion === null) return null;
+  return { prompt: prompt ?? 0, completion: completion ?? 0 };
+}
+
+export function addUsage(a: Usage | null, b: Usage | null): Usage | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return { prompt: a.prompt + b.prompt, completion: a.completion + b.completion };
+}
+
+function toolCallOf(id: string, name: string, args: unknown): ToolCall {
+  return { id, name, arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}) };
+}
+
+/** A content part list, in either wire's spelling, as normalized parts. */
+function partsOf(raw: unknown): NormalizedPart[] {
+  if (typeof raw === 'string') return raw === '' ? [] : [{ kind: 'text', text: raw }];
+  if (!isArray(raw)) return [];
+  const out: NormalizedPart[] = [];
+  for (const part of raw) {
+    if (typeof part === 'string') {
+      if (part !== '') out.push({ kind: 'text', text: part });
       continue;
     }
-    if (raw.role === 'assistant') {
-      const parts: NormPart[] = [];
-      const text = textOf(raw.content);
-      if (text !== '') parts.push({ type: 'text', text });
-      for (const call of Array.isArray(raw.tool_calls) ? raw.tool_calls : []) {
-        if (!isRecord(call) || !isRecord(call.function)) continue;
-        parts.push({
-          type: 'toolCall',
-          id: typeof call.id === 'string' ? call.id : '',
-          name: typeof call.function.name === 'string' ? call.function.name : '',
-          args: argumentsOf(call.function.arguments),
-        });
+    if (!isRecord(part)) continue;
+    const type = asString(part.type);
+    if (type === 'text') {
+      const text = asString(part.text);
+      if (text !== '') out.push({ kind: 'text', text });
+    } else if (type === 'image' || type === 'image_url' || type === 'input_image') {
+      if (isRecord(part.source) && part.source.type === 'base64') {
+        out.push({ kind: 'image', mimeType: asString(part.source.media_type), data: asString(part.source.data) });
+      } else if (isRecord(part.image_url)) {
+        out.push({ kind: 'image', mimeType: '', data: asString(part.image_url.url) });
       }
-      messages.push({ role: 'assistant', parts });
-      continue;
+    } else if (type === 'tool_use') {
+      out.push({ kind: 'toolCall', id: asString(part.id), name: asString(part.name), arguments: typeof part.input === 'string' ? part.input : JSON.stringify(part.input ?? {}) });
+    } else if (type === 'tool_result') {
+      const content = typeof part.content === 'string' ? part.content : isArray(part.content) ? part.content.map((c) => (isRecord(c) ? asString(c.text) : '')).join('') : '';
+      out.push({ kind: 'toolResult', toolCallId: asString(part.tool_use_id), content });
     }
-    if (raw.role === 'tool') {
-      messages.push({
-        role: 'user',
-        parts: [
-          {
-            type: 'toolResult',
-            toolCallId: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : '',
-            text: typeof raw.content === 'string' ? raw.content : textOf(raw.content),
-          },
-        ],
-      });
-      continue;
+  }
+  return out;
+}
+
+/** An OpenAI message, its `content` string or list and its `tool_calls`. */
+function openaiPartsOf(message: Record<string, unknown>): NormalizedPart[] {
+  const parts = partsOf(message.content);
+  if (isArray(message.tool_calls)) {
+    for (const rawCall of message.tool_calls) {
+      if (!isRecord(rawCall)) continue;
+      const fn = isRecord(rawCall.function) ? rawCall.function : {};
+      parts.push({ kind: 'toolCall', id: asString(rawCall.id), name: asString(fn.name), arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}) });
     }
-    if (raw.role !== 'user') continue;
-    const parts: NormPart[] = [];
-    if (typeof raw.content === 'string') {
-      if (raw.content !== '') parts.push({ type: 'text', text: raw.content });
-    } else if (Array.isArray(raw.content)) {
-      for (const block of raw.content) {
-        if (!isRecord(block)) continue;
-        if (block.type === 'text' && typeof block.text === 'string') {
-          parts.push({ type: 'text', text: block.text });
-        } else if (block.type === 'image_url' && isRecord(block.image_url)) {
-          const url = block.image_url.url;
-          if (typeof url === 'string' && url !== '') {
-            const data = /^data:([^,]*);base64,(.*)$/s.exec(url);
-            if (data !== null) {
-              parts.push({ type: 'image', mime: data[1] === '' ? 'image/png' : data[1], data: data[2] });
-            } else {
-              parts.push({ type: 'imageUrl', url });
-            }
-          }
-        }
-      }
-    }
-    messages.push({ role: 'user', parts });
   }
-  const tools: NormTool[] = [];
-  for (const raw of Array.isArray(body.tools) ? body.tools : []) {
-    if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') continue;
-    tools.push({
-      name: raw.function.name,
-      description: typeof raw.function.description === 'string' ? raw.function.description : '',
-      parameters: isRecord(raw.function.parameters)
-        ? raw.function.parameters
-        : { type: 'object', properties: {} },
-    });
+  return parts;
+}
+
+function normalizedToolOf(raw: unknown): NormalizedTool | null {
+  if (!isRecord(raw)) return null;
+  if (isRecord(raw.function)) {
+    return {
+      name: asString(raw.function.name),
+      description: asString(raw.function.description) !== '' ? asString(raw.function.description) : null,
+      schema: isRecord(raw.function.parameters) ? raw.function.parameters : {},
+    };
   }
-  let toolChoice: NormToolChoice | null = null;
-  const choice = body.tool_choice;
-  if (choice === 'auto') toolChoice = 'auto';
-  else if (choice === 'required') toolChoice = 'any';
-  else if (choice === 'none') toolChoice = 'none';
-  else if (isRecord(choice) && choice.type === 'function' && isRecord(choice.function)) {
-    toolChoice = { name: typeof choice.function.name === 'string' ? choice.function.name : '' };
-  }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
   return {
-    system: systemParts.join('\n'),
+    name: asString(raw.name),
+    description: asString(raw.description) !== '' ? asString(raw.description) : null,
+    schema: isRecord(raw.input_schema) ? raw.input_schema : {},
+  };
+}
+
+function toolChoiceOf(raw: unknown): NormalizedToolChoice {
+  if (isRecord(raw)) {
+    const type = asString(raw.type);
+    if (type === 'auto' || type === 'any') return { mode: 'auto' };
+    if (type === 'none') return { mode: 'none' };
+    if (type === 'tool' && asString(raw.name) !== '') return { mode: 'tool', name: asString(raw.name) };
+  }
+  if (raw === 'auto' || raw === 'any') return { mode: 'auto' };
+  if (raw === 'none') return { mode: 'none' };
+  return { mode: 'auto' };
+}
+
+function sharedNumbers(body: Record<string, unknown>): { maxTokens: number; temperature: number | null; topP: number | null } {
+  const maxTokens = asNumber(body.max_tokens) ?? asNumber(body.maxTokens) ?? 4096;
+  return { maxTokens, temperature: asNumber(body.temperature), topP: asNumber(body.top_p) ?? asNumber(body.topP) };
+}
+
+function stopOf(body: Record<string, unknown>): string[] {
+  const raw = body.stop ?? body.stop_sequences;
+  if (typeof raw === 'string') return raw === '' ? [] : [raw];
+  if (isArray(raw)) return raw.filter((s): s is string => typeof s === 'string' && s !== '');
+  return [];
+}
+
+/** An OpenAI client's body, normalized. `messages` arrive already unwrapped. */
+export function parseOpenAIRequest(body: Record<string, unknown>): NormalizedRequest {
+  const messages: NormalizedMessage[] = [];
+  let system = '';
+  const stop = stopOf(body);
+  const rawMessages = isArray(body.messages) ? body.messages : [];
+  for (const rawMessage of rawMessages) {
+    if (!isRecord(rawMessage)) continue;
+    const role = asString(rawMessage.role);
+    if (role === 'system') {
+      for (const part of partsOf(rawMessage.content)) if (part.kind === 'text') system += part.text;
+      continue;
+    }
+    if (role === 'tool') {
+      const parts: NormalizedPart[] = [];
+      for (const part of partsOf(rawMessage.content)) if (part.kind === 'text') parts.push({ kind: 'toolResult', toolCallId: asString(rawMessage.tool_call_id), content: part.text });
+      if (parts.length === 0) parts.push({ kind: 'toolResult', toolCallId: asString(rawMessage.tool_call_id), content: '' });
+      messages.push({ role: 'user', parts });
+      continue;
+    }
+    if (role === 'user' || role === 'assistant') messages.push({ role, parts: openaiPartsOf(rawMessage) });
+  }
+  if (typeof body.system === 'string' && body.system !== '') system += body.system;
+  const tools: NormalizedTool[] = [];
+  if (isArray(body.tools)) {
+    for (const rawTool of body.tools) {
+      const tool = normalizedToolOf(rawTool);
+      if (tool !== null && tool.name !== '') tools.push(tool);
+    }
+  }
+  const format = isRecord(body.response_format) ? body.response_format : null;
+  const shared = sharedNumbers(body);
+  return {
+    system: system === '' ? null : system,
     messages,
     tools,
-    toolChoice,
-    maxTokens: numberOrNull(body.max_tokens) ?? numberOrNull(body.max_completion_tokens),
-    temperature: numberOrNull(body.temperature),
-    topP: numberOrNull(body.top_p),
-    stops: stringList(body.stop),
-    jsonMode: format === 'json_object' || format === 'json_schema',
+    toolChoice: toolChoiceOf(body.tool_choice),
+    maxTokens: shared.maxTokens,
+    temperature: shared.temperature,
+    topP: shared.topP,
+    stopSequences: stop,
+    jsonMode: format !== null && asString(format.type) === 'json_object',
     stream: body.stream === true,
   };
 }
 
-/** An Anthropic Messages body as a normalized request. */
-export function parseAnthropicRequest(body: Json): NormRequest {
-  const messages: NormMessage[] = [];
-  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
-    if (!isRecord(raw)) continue;
-    if (raw.role === 'assistant') {
-      const parts: NormPart[] = [];
-      const content = raw.content;
-      if (typeof content === 'string') {
-        if (content !== '') parts.push({ type: 'text', text: content });
-      } else if (Array.isArray(content)) {
-        for (const block of content) {
-          if (!isRecord(block)) continue;
-          if (block.type === 'text' && typeof block.text === 'string') {
-            parts.push({ type: 'text', text: block.text });
-          } else if (block.type === 'tool_use') {
-            parts.push({
-              type: 'toolCall',
-              id: typeof block.id === 'string' ? block.id : '',
-              name: typeof block.name === 'string' ? block.name : '',
-              args: isRecord(block.input) ? block.input : {},
-            });
-          }
-        }
-      }
-      messages.push({ role: 'assistant', parts });
-      continue;
+/** An Anthropic client's body, normalized. */
+export function parseAnthropicRequest(body: Record<string, unknown>): NormalizedRequest {
+  const messages: NormalizedMessage[] = [];
+  const rawMessages = isArray(body.messages) ? body.messages : [];
+  for (const rawMessage of rawMessages) {
+    if (!isRecord(rawMessage)) continue;
+    const role = asString(rawMessage.role);
+    if (role === 'user' || role === 'assistant') messages.push({ role, parts: partsOf(rawMessage.content) });
+  }
+  let system: string | null = null;
+  if (typeof body.system === 'string') {
+    system = body.system === '' ? null : body.system;
+  } else if (isArray(body.system)) {
+    const text = body.system.map((p) => (isRecord(p) ? asString(p.text) : typeof p === 'string' ? p : '')).join('');
+    system = text === '' ? null : text;
+  }
+  const tools: NormalizedTool[] = [];
+  if (isArray(body.tools)) {
+    for (const rawTool of body.tools) {
+      const tool = normalizedToolOf(rawTool);
+      if (tool !== null && tool.name !== '') tools.push(tool);
     }
-    if (raw.role !== 'user') continue;
-    const parts: NormPart[] = [];
-    const content = raw.content;
-    if (typeof content === 'string') {
-      if (content !== '') parts.push({ type: 'text', text: content });
-    } else if (Array.isArray(content)) {
-      for (const block of content) {
-        if (!isRecord(block)) continue;
-        if (block.type === 'text' && typeof block.text === 'string') {
-          parts.push({ type: 'text', text: block.text });
-        } else if (block.type === 'image' && isRecord(block.source)) {
-          const source = block.source;
-          if (source.type === 'base64' && typeof source.data === 'string') {
-            parts.push({
-              type: 'image',
-              mime: typeof source.media_type === 'string' ? source.media_type : 'image/png',
-              data: source.data,
-            });
-          } else if (source.type === 'url' && typeof source.url === 'string') {
-            parts.push({ type: 'imageUrl', url: source.url });
-          }
-        } else if (block.type === 'tool_result') {
-          parts.push({
-            type: 'toolResult',
-            toolCallId: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-            text:
-              typeof block.content === 'string'
-                ? block.content
-                : textOf(block.content) !== ''
-                  ? textOf(block.content)
-                  : JSON.stringify(block.content ?? ''),
-          });
-        }
-      }
-    }
-    messages.push({ role: 'user', parts });
   }
-  const tools: NormTool[] = [];
-  for (const raw of Array.isArray(body.tools) ? body.tools : []) {
-    if (!isRecord(raw) || typeof raw.name !== 'string') continue;
-    tools.push({
-      name: raw.name,
-      description: typeof raw.description === 'string' ? raw.description : '',
-      parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
-    });
-  }
-  let toolChoice: NormToolChoice | null = null;
-  const choice = body.tool_choice;
-  if (isRecord(choice)) {
-    if (choice.type === 'auto') toolChoice = 'auto';
-    else if (choice.type === 'any') toolChoice = 'any';
-    else if (choice.type === 'none') toolChoice = 'none';
-    else if (choice.type === 'tool' && typeof choice.name === 'string') toolChoice = { name: choice.name };
-  }
+  const shared = sharedNumbers(body);
   return {
-    system: textOf(body.system),
+    system,
     messages,
     tools,
-    toolChoice,
-    maxTokens: numberOrNull(body.max_tokens),
-    temperature: numberOrNull(body.temperature),
-    topP: numberOrNull(body.top_p),
-    stops: stringList(body.stop_sequences),
-    // The Anthropic wire has no JSON mode: the echo never carries it, so never claim it.
+    toolChoice: toolChoiceOf(body.tool_choice),
+    maxTokens: shared.maxTokens,
+    temperature: shared.temperature,
+    topP: shared.topP,
+    stopSequences: isArray(body.stop_sequences) ? body.stop_sequences.filter((s): s is string => typeof s === 'string' && s !== '') : [],
     jsonMode: false,
     stream: body.stream === true,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Rendering a normalized request into an upstream wire.
-// ---------------------------------------------------------------------------
-
-function openAIMessages(norm: NormRequest): Json[] {
-  const out: Json[] = [];
-  if (norm.system !== '') out.push({ role: 'system', content: norm.system });
-  for (const message of norm.messages) {
-    if (message.role === 'assistant') {
-      const text = message.parts
-        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
-        .map((p) => p.text)
-        .join('\n');
-      const toolCalls = message.parts.filter(
-        (p): p is Extract<NormPart, { type: 'toolCall' }> => p.type === 'toolCall',
-      );
-      out.push({
-        role: 'assistant',
-        content: text !== '' ? text : null,
-        ...(toolCalls.length > 0
-          ? {
-              tool_calls: toolCalls.map((c) => ({
-                id: c.id,
-                type: 'function',
-                function: { name: c.name, arguments: JSON.stringify(c.args) },
-              })),
-            }
-          : {}),
-      });
-      continue;
-    }
-    // A user message: tool results become their own tool messages; the rest one message.
-    const parts: Json[] = [];
-    for (const part of message.parts) {
-      if (part.type === 'toolResult') {
-        out.push({ role: 'tool', tool_call_id: part.toolCallId, content: part.text });
-      } else if (part.type === 'text') {
-        parts.push({ type: 'text', text: part.text });
-      } else if (part.type === 'image') {
-        parts.push({
-          type: 'image_url',
-          image_url: { url: `data:${part.mime};base64,${part.data}` },
-        });
-      } else if (part.type === 'imageUrl') {
-        parts.push({ type: 'image_url', image_url: { url: part.url } });
-      }
-    }
-    if (parts.length > 0) out.push({ role: 'user', content: parts });
-  }
-  return out;
-}
-
-/** A normalized request as an OpenAI Chat Completions body naming `model`. */
-export function renderOpenAI(norm: NormRequest, model: string): Json {
-  const out: Json = { model, messages: openAIMessages(norm) };
-  if (norm.maxTokens !== null) out.max_tokens = norm.maxTokens;
-  if (norm.temperature !== null) out.temperature = norm.temperature;
-  if (norm.topP !== null) out.top_p = norm.topP;
-  if (norm.stops.length > 0) out.stop = norm.stops;
-  if (norm.tools.length > 0) {
-    out.tools = norm.tools.map((t) => ({
-      type: 'function',
-      function: { name: t.name, description: t.description, parameters: t.parameters },
-    }));
-  }
-  if (norm.toolChoice === 'auto') out.tool_choice = 'auto';
-  else if (norm.toolChoice === 'any') out.tool_choice = 'required';
-  else if (norm.toolChoice === 'none') out.tool_choice = 'none';
-  else if (norm.toolChoice !== null) {
-    out.tool_choice = { type: 'function', function: { name: norm.toolChoice.name } };
-  }
-  if (norm.jsonMode) out.response_format = { type: 'json_object' };
-  if (norm.stream) {
-    out.stream = true;
-    // Ask for the usage chunk: the trial compares the response's usage with the provider's.
-    out.stream_options = { include_usage: true };
-  }
-  return out;
-}
-
-function anthropicMessages(norm: NormRequest): Json[] {
-  const out: Json[] = [];
-  for (const message of norm.messages) {
-    if (message.role === 'assistant') {
-      const blocks: Json[] = [];
-      for (const part of message.parts) {
-        if (part.type === 'text') blocks.push({ type: 'text', text: part.text });
-        else if (part.type === 'toolCall') {
-          blocks.push({ type: 'tool_use', id: part.id, name: part.name, input: part.args });
-        }
-      }
-      out.push({ role: 'assistant', content: blocks });
-      continue;
-    }
-    const blocks: Json[] = [];
-    for (const part of message.parts) {
-      if (part.type === 'text') blocks.push({ type: 'text', text: part.text });
-      else if (part.type === 'image') {
-        blocks.push({
-          type: 'image',
-          source: { type: 'base64', media_type: part.mime, data: part.data },
-        });
-      } else if (part.type === 'imageUrl') {
-        blocks.push({ type: 'image', source: { type: 'url', url: part.url } });
-      } else if (part.type === 'toolResult') {
-        blocks.push({
-          type: 'tool_result',
-          tool_use_id: part.toolCallId,
-          content: part.text,
-        });
-      }
-    }
-    if (blocks.length > 0) out.push({ role: 'user', content: blocks });
-  }
-  return out;
-}
-
-/** A normalized request as an Anthropic Messages body naming `model`. */
-export function renderAnthropic(norm: NormRequest, model: string): Json {
-  const out: Json = { model, messages: anthropicMessages(norm) };
-  if (norm.system !== '') out.system = norm.system;
-  if (norm.maxTokens !== null) out.max_tokens = norm.maxTokens;
-  if (norm.temperature !== null) out.temperature = norm.temperature;
-  if (norm.topP !== null) out.top_p = norm.topP;
-  if (norm.stops.length > 0) out.stop_sequences = norm.stops;
-  if (norm.tools.length > 0) {
-    out.tools = norm.tools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      input_schema: t.parameters,
-    }));
-  }
-  if (norm.toolChoice === 'auto') out.tool_choice = { type: 'auto' };
-  else if (norm.toolChoice === 'any') out.tool_choice = { type: 'any' };
-  else if (norm.toolChoice !== null && norm.toolChoice !== 'none') {
-    out.tool_choice = { type: 'tool', name: norm.toolChoice.name };
-  }
-  // No JSON mode on this wire: the provider's echo never carries it, and a JSON-mode
-  // request is never routed here.
-  if (norm.stream) out.stream = true;
-  return out;
+/** Text parts of a normalized message, joined with a newline. */
+function textOf(message: NormalizedMessage): string {
+  return message.parts.filter((p): p is { kind: 'text'; text: string } => p.kind === 'text').map((p) => p.text).join('\n');
 }
 
 /**
- * A normalized request as a Gemini generateContent body. Consecutive same-role contents are
- * merged (Gemini wants user/model alternation); tool results ride as functionResponse parts.
+ * The normalized form as an OpenAI request body. JSON mode is sent only to a
+ * wire that can carry it; `jsonMode` is false on this path by construction.
  */
-export function renderGemini(norm: NormRequest): Json {
-  const contents: Json[] = [];
-  const push = (role: string, part: Json): void => {
-    const last = contents.length > 0 ? contents[contents.length - 1] : null;
-    if (last !== null && last.role === role && Array.isArray(last.parts)) {
-      (last.parts as Json[]).push(part);
-      return;
-    }
-    contents.push({ role, parts: [part] });
-  };
-  for (const message of norm.messages) {
+export function encodeOpenAIRequest(req: NormalizedRequest, model: string): Record<string, unknown> {
+  const messages: Record<string, unknown>[] = [];
+  if (req.system !== null) messages.push({ role: 'system', content: req.system });
+  for (const message of req.messages) {
+    const text = textOf(message);
     if (message.role === 'assistant') {
-      for (const part of message.parts) {
-        if (part.type === 'text') push('model', { text: part.text });
-        else if (part.type === 'toolCall') {
-          push('model', { functionCall: { name: part.name, args: part.args } });
-        }
-      }
+      const toolCalls = message.parts.filter((p): p is { kind: 'toolCall'; id: string; name: string; arguments: string } => p.kind === 'toolCall');
+      const body: Record<string, unknown> = { role: 'assistant', content: text === '' && toolCalls.length > 0 ? null : text };
+      if (toolCalls.length > 0) body.tool_calls = toolCalls.map((call, index) => ({ id: call.id === '' ? `call_${index}` : call.id, type: 'function', function: { name: call.name, arguments: call.arguments } }));
+      messages.push(body);
       continue;
     }
+    const content: unknown[] = [];
     for (const part of message.parts) {
-      if (part.type === 'text') push('user', { text: part.text });
-      else if (part.type === 'image') {
-        push('user', { inlineData: { mimeType: part.mime, data: part.data } });
-      } else if (part.type === 'imageUrl') {
-        push('user', { fileData: { fileUri: part.url } });
-      } else if (part.type === 'toolResult') {
-        push('user', {
-          functionResponse: { name: '', response: { content: part.text } },
-        });
-      }
+      if (part.kind === 'text') content.push({ type: 'text', text: part.text });
+      else if (part.kind === 'image') {
+        if (part.data.startsWith('data:') || part.data.startsWith('http')) content.push({ type: 'image_url', image_url: { url: part.data } });
+        else if (part.mimeType !== '') content.push({ type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${part.data}` } });
+      } else if (part.kind === 'toolResult') content.push({ type: 'text', text: part.content });
+    }
+    if (content.length === 0) continue;
+    const toolResults = message.parts.filter((p): p is { kind: 'toolResult'; toolCallId: string; content: string } => p.kind === 'toolResult');
+    if (toolResults.length > 0) {
+      for (const result of toolResults) messages.push({ role: 'tool', tool_call_id: result.toolCallId === '' ? 'call_0' : result.toolCallId, content: result.content });
+      if (text !== '') messages.push({ role: 'user', content: text });
+    } else {
+      messages.push({ role: 'user', content: content.length === 1 && content[0] && typeof content[0] === 'object' && (content[0] as Record<string, unknown>).type === 'text' ? text : content });
     }
   }
-  const out: Json = { contents };
-  if (norm.system !== '') out.systemInstruction = { parts: [{ text: norm.system }] };
-  if (norm.tools.length > 0) {
-    out.tools = [
+  const body: Record<string, unknown> = { model, messages };
+  if (req.tools.length > 0) body.tools = req.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description ?? undefined, parameters: tool.schema } }));
+  if (req.toolChoice.mode === 'any') body.tool_choice = 'auto';
+  else if (req.toolChoice.mode === 'none') body.tool_choice = 'none';
+  else if (req.toolChoice.mode === 'tool') body.tool_choice = { type: 'function', function: { name: req.toolChoice.name } };
+  if (req.maxTokens !== 4096) body.max_tokens = req.maxTokens;
+  if (req.temperature !== null) body.temperature = req.temperature;
+  if (req.topP !== null) body.top_p = req.topP;
+  if (req.stopSequences.length > 0) body.stop = req.stopSequences;
+  if (req.jsonMode) body.response_format = { type: 'json_object' };
+  return body;
+}
+
+/**
+ * The normalized form as an Anthropic request body. One message's content
+ * blocks keep their order: a text block, the images beside it, a tool_use
+ * block, then the tool_result blocks that answer it, all one message.
+ * JSON mode is never sent on this wire — an Anthropic upstream cannot carry
+ * it, and its echo answers whatever was sent.
+ */
+export function encodeAnthropicRequest(req: NormalizedRequest, model: string): Record<string, unknown> {
+  const messages: Record<string, unknown>[] = [];
+  for (const message of req.messages) {
+    const blocks: Record<string, unknown>[] = [];
+    for (const part of message.parts) {
+      if (part.kind === 'text') {
+        if (part.text !== '') blocks.push({ type: 'text', text: part.text });
+      } else if (part.kind === 'image') {
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: part.mimeType === '' ? 'image/png' : part.mimeType, data: part.data } });
+      } else if (part.kind === 'toolCall') {
+        let input: unknown = {};
+        try {
+          input = JSON.parse(part.arguments);
+        } catch {
+          input = {};
+        }
+        blocks.push({ type: 'tool_use', id: part.id === '' ? 'toolu_0' : part.id, name: part.name, input });
+      } else if (part.kind === 'toolResult') {
+        blocks.push({ type: 'tool_result', tool_use_id: part.toolCallId === '' ? 'toolu_0' : part.toolCallId, content: part.content });
+      }
+    }
+    if (blocks.length === 0) continue;
+    messages.push({ role: message.role, content: blocks });
+  }
+  const body: Record<string, unknown> = { model, messages, max_tokens: req.maxTokens };
+  if (req.system !== null) body.system = req.system;
+  if (req.tools.length > 0) body.tools = req.tools.map((tool) => ({ name: tool.name, description: tool.description ?? undefined, input_schema: tool.schema }));
+  if (req.toolChoice.mode === 'any') body.tool_choice = { type: 'auto' };
+  else if (req.toolChoice.mode === 'none') body.tool_choice = { type: 'none' };
+  else if (req.toolChoice.mode === 'tool') body.tool_choice = { type: 'tool', name: req.toolChoice.name };
+  if (req.temperature !== null) body.temperature = req.temperature;
+  if (req.topP !== null) body.top_p = req.topP;
+  if (req.stopSequences.length > 0) body.stop_sequences = req.stopSequences;
+  return body;
+}
+
+/** One Gemini content part: a text part, an inline image, or a function call. */
+function geminiPartOf(part: NormalizedPart): Record<string, unknown> | null {
+  if (part.kind === 'text') return part.text === '' ? null : { text: part.text };
+  if (part.kind === 'image') {
+    return { inlineData: { mimeType: part.mimeType === '' ? 'image/png' : part.mimeType, data: part.data } };
+  }
+  if (part.kind === 'toolCall') {
+    let args: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(part.arguments);
+      if (isRecord(parsed)) args = parsed;
+    } catch {
+      args = {};
+    }
+    return { functionCall: { name: part.name, args } };
+  }
+  return null;
+}
+
+/** The normalized form as a Gemini generateContent body. */
+export function encodeGeminiRequest(req: NormalizedRequest, model: string): Record<string, unknown> {
+  const contents: Record<string, unknown>[] = [];
+  if (req.system !== null) contents.push({ role: 'user', parts: [{ text: req.system }] });
+  for (const message of req.messages) {
+    const parts: Record<string, unknown>[] = [];
+    for (const part of message.parts) {
+      if (part.kind === 'toolResult') {
+        parts.push({ functionResponse: { name: 'tool', response: { output: part.content } } });
+        continue;
+      }
+      const gemini = geminiPartOf(part);
+      if (gemini !== null) parts.push(gemini);
+    }
+    if (parts.length === 0) continue;
+    contents.push({ role: message.role === 'assistant' ? 'model' : 'user', parts });
+  }
+  const config: Record<string, unknown> = { maxOutputTokens: req.maxTokens };
+  if (req.temperature !== null) config.temperature = req.temperature;
+  if (req.topP !== null) config.topP = req.topP;
+  if (req.stopSequences.length > 0) config.stopSequences = req.stopSequences;
+  if (req.jsonMode) config.responseMimeType = 'application/json';
+  if (req.tools.length > 0) {
+    config.tools = [
       {
-        functionDeclarations: norm.tools.map((t) => ({
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters,
+        functionDeclarations: req.tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description ?? '',
+          parameters: tool.schema,
         })),
       },
     ];
   }
-  const config: Json = {};
-  if (norm.maxTokens !== null) config.maxOutputTokens = norm.maxTokens;
-  if (norm.stops.length > 0) config.stopSequences = norm.stops;
-  if (norm.temperature !== null) config.temperature = norm.temperature;
-  if (norm.topP !== null) config.topP = norm.topP;
-  if (norm.jsonMode) config.responseMimeType = 'application/json';
-  if (Object.keys(config).length > 0) out.generationConfig = config;
-  return out;
+  return { model, contents, generationConfig: config };
 }
 
-// ---------------------------------------------------------------------------
-// The normalized answer: what one provider call returned, in no wire's shape.
-// ---------------------------------------------------------------------------
-
-export interface NormAnswer {
-  text: string;
-  usage: { input: number; output: number } | null;
+/** The stop reason in the one family this aggregator reports: "stop" or "length". */
+function stopFamily(reason: string): StopReason {
+  if (reason === 'length' || reason === 'max_tokens') return 'length';
+  if (reason === 'tool_calls' || reason === 'tool_use') return 'tool_calls';
+  if (reason === 'content_filter') return 'content_filter';
+  return 'stop';
 }
 
-/** One SSE frame's event name and data payload, in arrival order. */
-export interface SseFrame {
-  event: string | null;
-  data: string;
-}
-
-export function parseSse(text: string): SseFrame[] {
-  const frames: SseFrame[] = [];
-  for (const raw of text.replace(/\r\n/g, '\n').split('\n\n')) {
-    if (raw.trim() === '') continue;
-    let event: string | null = null;
-    const dataLines: string[] = [];
-    for (const line of raw.split('\n')) {
-      if (line.startsWith('event:')) event = line.slice(6).trim();
-      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
-    }
-    if (dataLines.length > 0) frames.push({ event, data: dataLines.join('\n') });
-  }
-  return frames;
-}
-
-function geminiPartsText(parts: unknown): string {
-  if (!Array.isArray(parts)) return '';
-  return parts
-    .flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : []))
-    .join('');
-}
-
-/** An OpenAI Chat Completions answer (JSON body or SSE text) as a normalized answer. */
-export function parseOpenAIAnswer(body: string, stream: boolean): NormAnswer {
-  if (!stream) {
-    try {
-      const value: unknown = JSON.parse(body);
-      if (!isRecord(value)) return { text: '', usage: null };
-      const choices = Array.isArray(value.choices) ? value.choices : [];
-      const choice = isRecord(choices[0]) ? choices[0] : {};
-      const message = isRecord(choice.message) ? choice.message : {};
-      const text =
-        typeof message.content === 'string'
-          ? message.content
-          : textOf(message.content);
-      const usage = isRecord(value.usage)
-        ? {
-            input: numberOrNull(value.usage.prompt_tokens) ?? 0,
-            output: numberOrNull(value.usage.completion_tokens) ?? 0,
-          }
-        : null;
-      return { text, usage };
-    } catch {
-      return { text: '', usage: null };
+/** The text an OpenAI choice carries: its message content, or its delta. */
+function openaiChoiceText(choice: Record<string, unknown>): { text: string; calls: ToolCall[] } {
+  const message = isRecord(choice.message) ? choice.message : isRecord(choice.delta) ? choice.delta : null;
+  if (message === null) return { text: '', calls: [] };
+  const text = typeof message.content === 'string' ? message.content : '';
+  const calls: ToolCall[] = [];
+  if (isArray(message.tool_calls)) {
+    for (const rawCall of message.tool_calls) {
+      if (!isRecord(rawCall)) continue;
+      const fn = isRecord(rawCall.function) ? rawCall.function : {};
+      calls.push(toolCallOf(asString(rawCall.id), asString(fn.name), fn.arguments));
     }
   }
+  return { text, calls };
+}
+
+/** One OpenAI response or chunk, normalized. */
+export function parseOpenAIAnswer(body: unknown): NormalizedAnswer {
+  if (!isRecord(body)) return { text: '', usage: null, stopReason: 'stop', toolCalls: [] };
+  const choices = isArray(body.choices) ? body.choices : [];
   let text = '';
-  let usage: NormAnswer['usage'] = null;
-  for (const frame of parseSse(body)) {
-    if (frame.data === '[DONE]') continue;
-    let chunk: unknown;
+  let stopReason: StopReason = 'stop';
+  const toolCalls: ToolCall[] = [];
+  for (const choice of choices) {
+    if (!isRecord(choice)) continue;
+    const parsed = openaiChoiceText(choice);
+    text += parsed.text;
+    toolCalls.push(...parsed.calls);
+    stopReason = stopFamily(asString(choice.finish_reason));
+  }
+  return { text, usage: usageOf(body.usage), stopReason, toolCalls };
+}
+
+/** An Anthropic response or content-block event, normalized. */
+export function parseAnthropicAnswer(body: unknown): NormalizedAnswer {
+  if (!isRecord(body)) return { text: '', usage: null, stopReason: 'stop', toolCalls: [] };
+  let text = '';
+  const toolCalls: ToolCall[] = [];
+  const content = isArray(body.content) ? body.content : [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    if (block.type === 'text') text += asString(block.text);
+    else if (block.type === 'tool_use') toolCalls.push(toolCallOf(asString(block.id), asString(block.name), block.input));
+  }
+  const stopReason = body.stop_reason === 'tool_use' ? 'tool_calls' : stopFamily(asString(body.stop_reason));
+  return { text, usage: usageOf(body.usage), stopReason, toolCalls };
+}
+
+/** A Gemini generateContent response, normalized. */
+export function parseGeminiAnswer(body: unknown): NormalizedAnswer {
+  if (!isRecord(body)) return { text: '', usage: null, stopReason: 'stop', toolCalls: [] };
+  const candidates = isArray(body.candidates) ? body.candidates : [];
+  let text = '';
+  const toolCalls: ToolCall[] = [];
+  let stopReason: StopReason = 'stop';
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) continue;
+    const content = isRecord(candidate.content) ? candidate.content : null;
+    const parts = content !== null && isArray(content.parts) ? content.parts : [];
+    for (const part of parts) {
+      if (!isRecord(part)) continue;
+      if (typeof part.text === 'string') text += part.text;
+      else if (isRecord(part.functionCall)) toolCalls.push(toolCallOf('', asString(part.functionCall.name), part.functionCall.args));
+    }
+    const reason = asString(candidate.finishReason);
+    if (reason === 'MAX_TOKENS') stopReason = 'length';
+    else if (reason === 'SAFETY') stopReason = 'content_filter';
+    else stopReason = 'stop';
+  }
+  return { text, usage: usageOf(body.usageMetadata), stopReason, toolCalls };
+}
+
+/** The text an Anthropic stream event contributes: its delta's text. */
+function anthropicDeltaText(event: Record<string, unknown>): string {
+  if (!isRecord(event.delta)) return '';
+  return event.delta.type === 'text_delta' ? asString(event.delta.text) : '';
+}
+
+/** The tool use one Anthropic content-block start carries. */
+function anthropicBlockCall(event: Record<string, unknown>): ToolCall | null {
+  if (!isRecord(event.content_block)) return null;
+  const block = event.content_block;
+  if (block.type !== 'tool_use') return null;
+  return toolCallOf(asString(block.id), asString(block.name), block.input);
+}
+
+/** An OpenAI event stream, re-assembled into one answer. */
+export function parseOpenAIStream(text: string): NormalizedAnswer {
+  let answer: NormalizedAnswer = { text: '', usage: null, stopReason: 'stop', toolCalls: [] };
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.slice(5).trim();
+    if (payload === '' || payload === '[DONE]') continue;
+    let parsed: unknown;
     try {
-      chunk = JSON.parse(frame.data);
+      parsed = JSON.parse(payload);
     } catch {
       continue;
     }
-    if (!isRecord(chunk)) continue;
-    if (isRecord(chunk.usage)) {
-      usage = {
-        input: numberOrNull(chunk.usage.prompt_tokens) ?? 0,
-        output: numberOrNull(chunk.usage.completion_tokens) ?? 0,
-      };
-    }
-    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-    const choice = isRecord(choices[0]) ? choices[0] : null;
-    if (choice === null) continue;
-    const delta = isRecord(choice.delta) ? choice.delta : {};
-    if (typeof delta.content === 'string') text += delta.content;
+    const part = parseOpenAIAnswer(parsed);
+    answer = { text: answer.text + part.text, usage: addUsage(answer.usage, part.usage), stopReason: part.stopReason, toolCalls: [...answer.toolCalls, ...part.toolCalls] };
   }
-  return { text, usage };
+  return answer;
 }
 
-/** An Anthropic Messages answer (JSON body or SSE text) as a normalized answer. */
-export function parseAnthropicAnswer(body: string, stream: boolean): NormAnswer {
-  if (!stream) {
-    try {
-      const value: unknown = JSON.parse(body);
-      if (!isRecord(value)) return { text: '', usage: null };
-      const usage = isRecord(value.usage)
-        ? {
-            input: numberOrNull(value.usage.input_tokens) ?? 0,
-            output: numberOrNull(value.usage.output_tokens) ?? 0,
-          }
-        : null;
-      return { text: textOf(value.content), usage };
-    } catch {
-      return { text: '', usage: null };
+/** An Anthropic event stream, re-assembled into one answer. */
+export function parseAnthropicStream(text: string): NormalizedAnswer {
+  let answer: NormalizedAnswer = { text: '', usage: null, stopReason: 'stop', toolCalls: [] };
+  let currentEvent = '';
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('event:')) {
+      currentEvent = trimmed.slice(6).trim();
+      continue;
     }
-  }
-  let text = '';
-  let input: number | null = null;
-  let output: number | null = null;
-  for (const frame of parseSse(body)) {
-    let data: unknown;
+    if (!trimmed.startsWith('data:')) continue;
+    const payload = trimmed.slice(5).trim();
+    if (payload === '') continue;
+    let parsed: unknown;
     try {
-      data = JSON.parse(frame.data);
+      parsed = JSON.parse(payload);
     } catch {
       continue;
     }
-    if (!isRecord(data)) continue;
-    if (frame.event === 'message_start' && isRecord(data.message) && isRecord(data.message.usage)) {
-      input = numberOrNull(data.message.usage.input_tokens);
-    } else if (frame.event === 'content_block_delta' && isRecord(data.delta)) {
-      if (data.delta.type === 'text_delta' && typeof data.delta.text === 'string') {
-        text += data.delta.text;
+    if (!isRecord(parsed)) continue;
+    if (currentEvent === 'message_start' || parsed.type === 'message_start') {
+      if (isRecord(parsed.message)) {
+        const start = parseAnthropicAnswer(parsed.message);
+        answer = { ...answer, usage: addUsage(answer.usage, start.usage) };
       }
-    } else if (frame.event === 'message_delta' && isRecord(data.usage)) {
-      output = numberOrNull(data.usage.output_tokens);
+      continue;
+    }
+    if (currentEvent === 'content_block_delta' || parsed.type === 'content_block_delta') {
+      answer = { ...answer, text: answer.text + anthropicDeltaText(parsed) };
+      continue;
+    }
+    if (currentEvent === 'content_block_start' || parsed.type === 'content_block_start') {
+      const call = anthropicBlockCall(parsed);
+      if (call !== null) answer = { ...answer, toolCalls: [...answer.toolCalls, call] };
+      continue;
+    }
+    if (currentEvent === 'message_delta' || parsed.type === 'message_delta') {
+      const delta = parseAnthropicAnswer(parsed);
+      // A message_delta carries its stop reason inside `delta`, not at the top.
+      const deltaStop = isRecord(parsed.delta) ? asString(parsed.delta.stop_reason) : '';
+      answer = { ...answer, usage: addUsage(answer.usage, delta.usage), stopReason: deltaStop !== '' ? stopFamily(deltaStop) : delta.stopReason };
+      continue;
     }
   }
-  return { text, usage: input === null && output === null ? null : { input: input ?? 0, output: output ?? 0 } };
+  return answer;
 }
 
-/** A Gemini generateContent answer (JSON body or SSE text) as a normalized answer. */
-export function parseGeminiAnswer(body: string, stream: boolean): NormAnswer {
-  if (!stream) {
+/** A Gemini stream: one JSON object per line, re-assembled into one answer. */
+export function parseGeminiStream(text: string): NormalizedAnswer {
+  let answer: NormalizedAnswer = { text: '', usage: null, stopReason: 'stop', toolCalls: [] };
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:') && !trimmed.startsWith('{')) continue;
+    const payload = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
+    if (payload === '') continue;
+    let parsed: unknown;
     try {
-      const value: unknown = JSON.parse(body);
-      if (!isRecord(value)) return { text: '', usage: null };
-      const candidates = Array.isArray(value.candidates) ? value.candidates : [];
-      const first = isRecord(candidates[0]) ? candidates[0] : {};
-      const content = isRecord(first.content) ? first.content : {};
-      const usage = isRecord(value.usageMetadata)
-        ? {
-            input: numberOrNull(value.usageMetadata.promptTokenCount) ?? 0,
-            output: numberOrNull(value.usageMetadata.candidatesTokenCount) ?? 0,
-          }
-        : null;
-      return { text: geminiPartsText(content.parts), usage };
-    } catch {
-      return { text: '', usage: null };
-    }
-  }
-  let text = '';
-  let usage: NormAnswer['usage'] = null;
-  for (const frame of parseSse(body)) {
-    let value: unknown;
-    try {
-      value = JSON.parse(frame.data);
+      parsed = JSON.parse(payload);
     } catch {
       continue;
     }
-    if (!isRecord(value)) continue;
-    const candidates = Array.isArray(value.candidates) ? value.candidates : [];
-    const first = isRecord(candidates[0]) ? candidates[0] : {};
-    const content = isRecord(first.content) ? first.content : {};
-    text += geminiPartsText(content.parts);
-    if (isRecord(value.usageMetadata)) {
-      usage = {
-        input: numberOrNull(value.usageMetadata.promptTokenCount) ?? 0,
-        output: numberOrNull(value.usageMetadata.candidatesTokenCount) ?? 0,
-      };
-    }
+    const part = parseGeminiAnswer(parsed);
+    answer = { text: answer.text + part.text, usage: addUsage(answer.usage, part.usage), stopReason: part.stopReason, toolCalls: [...answer.toolCalls, ...part.toolCalls] };
   }
-  return { text, usage };
+  return answer;
 }
 
-// ---------------------------------------------------------------------------
-// Rendering a normalized answer into the client's wire.
-// ---------------------------------------------------------------------------
-
-/** One server-sent event: `event: <name>` when named, then the data line, then blank. */
-export function sseEvent(event: string | null, data: unknown): string {
-  return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
-}
-
-/** Split text into pieces of at most `size` characters, for streaming deltas. */
-function pieces(text: string, size = 64): string[] {
-  if (text === '') return [];
-  const out: string[] = [];
-  for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
-  return out;
-}
-
-/** A normalized answer as an OpenAI Chat Completions body (JSON, not streamed). */
-export function renderOpenAIJson(ans: NormAnswer, model: string): Json {
-  const usage = ans.usage ?? { input: 0, output: 0 };
-  return {
-    id: 'chatcmpl-agg',
-    object: 'chat.completion',
-    created: FIXED_OPENAI_CREATED,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: 'assistant', content: ans.text },
-        finish_reason: 'stop',
-        logprobs: null,
-      },
-    ],
-    usage: {
-      prompt_tokens: usage.input,
-      completion_tokens: usage.output,
-      total_tokens: usage.input + usage.output,
+/** An OpenAI response body: choices, then usage, then the fixed fields. */
+export function emitOpenAIJson(answer: NormalizedAnswer, model: string, id: string): Record<string, unknown> {
+  const choice: Record<string, unknown> = {
+    index: 0,
+    message: {
+      role: 'assistant',
+      content: answer.text,
+      ...(answer.toolCalls.length > 0
+        ? {
+            tool_calls: answer.toolCalls.map((call, index) => ({ id: call.id === '' ? `call_${index}` : call.id, type: 'function', function: { name: call.name, arguments: call.arguments } })),
+          }
+        : {}),
     },
+    finish_reason: answer.toolCalls.length > 0 ? 'tool_calls' : 'stop',
+  };
+  return {
+    id,
+    object: 'chat.completion',
+    created: 0,
+    model,
+    choices: [choice],
+    usage: { prompt_tokens: answer.usage?.prompt ?? 0, completion_tokens: answer.usage?.completion ?? 0, total_tokens: (answer.usage?.prompt ?? 0) + (answer.usage?.completion ?? 0) },
   };
 }
 
-/** A normalized answer as an OpenAI SSE stream: role, content, finish, usage, [DONE]. */
-export function renderOpenAIStream(ans: NormAnswer, model: string): string {
-  const usage = ans.usage ?? { input: 0, output: 0 };
-  const chunk = (delta: Json, finish: string | null): Json => ({
-    id: 'chatcmpl-agg',
-    object: 'chat.completion.chunk',
-    created: FIXED_OPENAI_CREATED,
-    model,
-    choices: [{ index: 0, delta, finish_reason: finish }],
-  });
-  let out = sseEvent(null, chunk({ role: 'assistant', content: '' }, null));
-  for (const piece of pieces(ans.text)) out += sseEvent(null, chunk({ content: piece }, null));
-  out += sseEvent(null, chunk({}, 'stop'));
-  out += sseEvent(null, {
-    id: 'chatcmpl-agg',
-    object: 'chat.completion.chunk',
-    created: FIXED_OPENAI_CREATED,
-    model,
-    choices: [],
-    usage: {
-      prompt_tokens: usage.input,
-      completion_tokens: usage.output,
-      total_tokens: usage.input + usage.output,
-    },
-  });
-  out += 'data: [DONE]\n\n';
-  return out;
+/** An OpenAI event stream: role, content, finish-with-usage, then [DONE]. */
+export function emitOpenAIStream(answer: NormalizedAnswer, model: string, id: string): string {
+  const base = { id, object: 'chat.completion.chunk', created: 0, model };
+  const lines: string[] = [];
+  lines.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}`);
+  if (answer.text !== '') lines.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: answer.text }, finish_reason: null }] })}`);
+  lines.push(
+    `data: ${JSON.stringify({
+      ...base,
+      choices: [{ index: 0, delta: {}, finish_reason: answer.toolCalls.length > 0 ? 'tool_calls' : 'stop' }],
+      usage: { prompt_tokens: answer.usage?.prompt ?? 0, completion_tokens: answer.usage?.completion ?? 0, total_tokens: (answer.usage?.prompt ?? 0) + (answer.usage?.completion ?? 0) },
+    })}`,
+  );
+  lines.push('data: [DONE]');
+  return `${lines.join('\n')}\n`;
 }
 
-/** A normalized answer as an Anthropic Messages body (JSON, not streamed). */
-export function renderAnthropicJson(ans: NormAnswer, model: string): Json {
-  const usage = ans.usage ?? { input: 0, output: 0 };
+/** An Anthropic response body: content blocks, then usage, then the stop reason. */
+export function emitAnthropicJson(answer: NormalizedAnswer, model: string, id: string): Record<string, unknown> {
+  const content: Record<string, unknown>[] = [];
+  if (answer.text !== '') content.push({ type: 'text', text: answer.text });
+  for (const call of answer.toolCalls) {
+    let input: unknown = {};
+    try {
+      input = JSON.parse(call.arguments);
+    } catch {
+      input = {};
+    }
+    content.push({ type: 'tool_use', id: call.id === '' ? 'toolu_0' : call.id, name: call.name, input });
+  }
   return {
-    id: 'msg_agg',
+    id,
     type: 'message',
     role: 'assistant',
     model,
-    content: [{ type: 'text', text: ans.text }],
-    stop_reason: 'end_turn',
+    content,
+    stop_reason: answer.toolCalls.length > 0 ? 'tool_use' : 'end_turn',
     stop_sequence: null,
-    usage: { input_tokens: usage.input, output_tokens: usage.output },
+    usage: { input_tokens: answer.usage?.prompt ?? 0, output_tokens: answer.usage?.completion ?? 0 },
   };
 }
 
-/**
- * A normalized answer as an Anthropic SSE stream: message_start, one text block with
- * deltas, message_delta carrying the stop reason and output tokens, message_stop.
- */
-export function renderAnthropicStream(ans: NormAnswer, model: string): string {
-  const usage = ans.usage ?? { input: 0, output: 0 };
-  let out = sseEvent('message_start', {
-    type: 'message_start',
-    message: {
-      id: 'msg_agg',
-      type: 'message',
-      role: 'assistant',
-      model,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: usage.input, output_tokens: 0 },
-    },
-  });
-  out += sseEvent('content_block_start', {
-    type: 'content_block_start',
-    index: 0,
-    content_block: { type: 'text', text: '' },
-  });
-  for (const piece of pieces(ans.text)) {
-    out += sseEvent('content_block_delta', {
-      type: 'content_block_delta',
-      index: 0,
-      delta: { type: 'text_delta', text: piece },
-    });
+/** An Anthropic event stream: message_start, blocks, deltas, message_delta, message_stop. */
+export function emitAnthropicStream(answer: NormalizedAnswer, model: string, id: string): string {
+  const lines: string[] = [];
+  lines.push(
+    `event: message_start\ndata: ${JSON.stringify({
+      type: 'message_start',
+      message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: answer.usage?.prompt ?? 0, output_tokens: 0 } },
+    })}`,
+  );
+  if (answer.text !== '') {
+    lines.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}`);
+    lines.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } })}`);
+    lines.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}`);
   }
-  out += sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-  out += sseEvent('message_delta', {
-    type: 'message_delta',
-    delta: { stop_reason: 'end_turn', stop_sequence: null },
-    usage: { output_tokens: usage.output },
-  });
-  out += sseEvent('message_stop', { type: 'message_stop' });
-  return out;
+  for (let i = 0; i < answer.toolCalls.length; i += 1) {
+    const call = answer.toolCalls[i];
+    const index = answer.text !== '' ? i + 1 : i;
+    let input: unknown = {};
+    try {
+      input = JSON.parse(call.arguments);
+    } catch {
+      input = {};
+    }
+    lines.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: call.id === '' ? 'toolu_0' : call.id, name: call.name, input } })}`);
+    lines.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index })}`);
+  }
+  lines.push(
+    `event: message_delta\ndata: ${JSON.stringify({
+      type: 'message_delta',
+      delta: { stop_reason: answer.toolCalls.length > 0 ? 'tool_use' : 'end_turn', stop_sequence: null },
+      usage: { output_tokens: answer.usage?.completion ?? 0 },
+    })}`,
+  );
+  lines.push('event: message_stop\ndata: {"type":"message_stop"}');
+  return `${lines.join('\n')}\n`;
 }
