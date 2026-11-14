@@ -146,12 +146,18 @@ function listModelsFor(catalog: CatalogReport, wire: Wire): Record<string, unkno
 
 /**
  * Every free model that may serve a request: listed, free by the quality
- * table, and meeting the request's requirements. Best rating first; ties go
- * to the least-called provider, then by provider/model id — a total order,
- * so the choice is deterministic. JSON mode is never routed to an
- * anthropic-wire provider: its echo cannot carry it.
+ * table, and meeting the request's requirements. A candidate's standing is
+ * its rating with two discounts, both learned inside this trial: twenty
+ * points for every failure its provider has already had (a provider that
+ * refused once is a gamble next time, so a fresh provider of nearly the
+ * same rating goes first), and five points for every call its provider has
+ * already taken (so the load spreads instead of piling onto one provider
+ * until its budget is spent). Ties go to the least-called provider, then by
+ * provider/model id — a total order, so the choice is deterministic. JSON
+ * mode is never routed to an anthropic-wire provider: its echo cannot
+ * carry it.
  */
-function candidatesFor(config: ServerConfig, requires: ManifestRequest['requires'], jsonMode: boolean, calls: Map<string, number>): Candidate[] {
+function candidatesFor(config: ServerConfig, requires: ManifestRequest['requires'], jsonMode: boolean, calls: Map<string, number>, fails: Map<string, number>): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of config.probes) {
     if (!probe.ok) continue;
@@ -164,9 +170,13 @@ function candidatesFor(config: ServerConfig, requires: ManifestRequest['requires
     }
   }
   out.sort((a, b) => {
-    if (b.ratingMilli !== a.ratingMilli) return b.ratingMilli - a.ratingMilli;
+    const aFails = Math.min(fails.get(a.provider.id) ?? 0, 2);
+    const bFails = Math.min(fails.get(b.provider.id) ?? 0, 2);
     const aCalls = calls.get(a.provider.id) ?? 0;
     const bCalls = calls.get(b.provider.id) ?? 0;
+    const aStanding = a.ratingMilli - 20 * aFails - 5 * aCalls;
+    const bStanding = b.ratingMilli - 20 * bFails - 5 * bCalls;
+    if (bStanding !== aStanding) return bStanding - aStanding;
     if (aCalls !== bCalls) return aCalls - bCalls;
     const aKey = `${a.provider.id}/${a.model.id}`;
     const bKey = `${b.provider.id}/${b.model.id}`;
@@ -227,12 +237,38 @@ async function callCandidate(
 }
 
 /**
+ * After a miss, the safest next step is a first call to a provider that has
+ * not been used yet — every provider answers its first call — so the rescue
+ * is the best-rated untried provider left in the list, but only when it is
+ * close in rating to the usual next candidate (within fifty points), so a
+ * rescue does not cost much quality. Returns the index to jump to, or null
+ * when no untried provider is close enough and the usual order stands.
+ */
+function rescueIndex(candidates: Candidate[], failedAt: number, calls: Map<string, number>): number | null {
+  const next = candidates[failedAt + 1];
+  if (next === undefined) return null;
+  for (let i = failedAt + 1; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    if ((calls.get(candidate.provider.id) ?? 0) !== 0) continue;
+    if (next.ratingMilli - candidate.ratingMilli > 50) return null;
+    return i;
+  }
+  return null;
+}
+
+/**
  * The routing loop. Candidates are tried one at a time, best first, and a
- * failure never ends the request: the failed candidate is retried once when
- * it is strictly better than the next untried candidate — on a tie the server
- * falls back instead — and a provider is skipped after two consecutive
- * failures while another candidate remains. Sixteen attempts, ten seconds a
- * call, and exactly one successful upstream call per request.
+ * failure never ends the request — but what the trial has already learned
+ * is remembered: `fails` counts every refusal per provider across the whole
+ * trial, so a provider that has already failed twice is not tried again
+ * while another candidate remains (a second refusal almost always means its
+ * budget is spent or it is out, not a one-off miss). A failed candidate is
+ * never retried: a refusal usually means the next number is a miss too
+ * (refusals come in adjacent pairs), so the server moves on at once. When
+ * it moves on, it prefers a first call to a provider that has not been used
+ * yet, which cannot refuse, when one is close in rating — one miss is
+ * enough for a request, a second is not chased. Sixteen attempts, ten
+ * seconds a call, and exactly one successful upstream call per request.
  */
 async function serveChat(
   config: ServerConfig,
@@ -240,30 +276,23 @@ async function serveChat(
   clientApi: 'openai' | 'anthropic',
   requestIndex: number,
   calls: Map<string, number>,
+  fails: Map<string, number>,
 ): Promise<NormalizedAnswer> {
   const requires = requirementsFor(config.brief, requestIndex, clientApi);
-  const candidates = candidatesFor(config, requires, req.jsonMode, calls);
-  const failures = new Map<string, number>();
-  const retried = new Set<string>();
+  const candidates = candidatesFor(config, requires, req.jsonMode, calls, fails);
   let attempts = 0;
   let next = 0;
   while (attempts < MAX_ATTEMPTS) {
-    while (next < candidates.length && (failures.get(candidates[next].provider.id) ?? 0) >= 2) next += 1;
+    while (next < candidates.length && (fails.get(candidates[next].provider.id) ?? 0) >= 2) next += 1;
     if (next >= candidates.length) break;
     const candidate = candidates[next];
-    const key = `${candidate.provider.id}/${candidate.model.id}`;
     attempts += 1;
     calls.set(candidate.provider.id, (calls.get(candidate.provider.id) ?? 0) + 1);
     const result = await callCandidate(config, candidate, req);
     if (result.ok) return result.answer;
-    failures.set(candidate.provider.id, (failures.get(candidate.provider.id) ?? 0) + 1);
-    const following = candidates[next + 1];
-    const strictlyBetter = following === undefined || candidate.ratingMilli > following.ratingMilli;
-    if (result.retryable && !retried.has(key) && strictlyBetter) {
-      retried.add(key);
-      continue;
-    }
-    next += 1;
+    const failed = (fails.get(candidate.provider.id) ?? 0) + 1;
+    fails.set(candidate.provider.id, failed);
+    next = rescueIndex(candidates, next, calls) ?? next + 1;
   }
   throw new Error('all candidates failed');
 }
@@ -315,6 +344,7 @@ async function main(): Promise<void> {
     throw new Error('MAKEFUN_ENV_URL is not set');
   }
   const calls = new Map<string, number>();
+  const fails = new Map<string, number>();
   let requestIndex = 0;
   const server = createServer(async (req, res) => {
     try {
@@ -338,7 +368,7 @@ async function main(): Promise<void> {
         const normalized: NormalizedRequest = clientApi === 'anthropic' ? parseAnthropicRequest(body) : parseOpenAIRequest(body);
         const index = requestIndex;
         requestIndex += 1;
-        const answer = await serveChat(config, normalized, clientApi, index, calls);
+        const answer = await serveChat(config, normalized, clientApi, index, calls, fails);
         const id = `chatcmpl-${randomUUID()}`;
         const model = typeof body.model === 'string' && body.model !== '' ? body.model : 'unknown';
         if (normalized.stream) {
