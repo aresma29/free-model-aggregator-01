@@ -98,20 +98,20 @@ function asNumber(value: unknown): number | null {
 
 /**
  * A token count as one wire's spelling: output_tokens (Anthropic),
- * outputTokens (Gemini), completion_tokens (OpenAI), or a bare `output`.
+ * candidatesTokenCount (Gemini), completion_tokens (OpenAI), or a bare `output`.
  */
 function tokensOut(value: unknown): number | null {
   if (!isRecord(value)) return null;
-  return asNumber(value.output_tokens) ?? asNumber(value.outputTokens) ?? asNumber(value.completion_tokens) ?? asNumber(value.output);
+  return asNumber(value.output_tokens) ?? asNumber(value.candidatesTokenCount) ?? asNumber(value.completion_tokens) ?? asNumber(value.output);
 }
 
 /**
- * A prompt token count: input_tokens (Anthropic), promptTokens (Gemini),
+ * A prompt token count: input_tokens (Anthropic), promptTokenCount (Gemini),
  * prompt_tokens (OpenAI), or a bare `input`.
  */
 function tokensIn(value: unknown): number | null {
   if (!isRecord(value)) return null;
-  return asNumber(value.input_tokens) ?? asNumber(value.promptTokens) ?? asNumber(value.prompt_tokens) ?? asNumber(value.input);
+  return asNumber(value.input_tokens) ?? asNumber(value.promptTokenCount) ?? asNumber(value.prompt_tokens) ?? asNumber(value.input);
 }
 
 /** A usage block in any wire's spelling, mapped exactly onto prompt/completion. */
@@ -367,7 +367,9 @@ export function encodeAnthropicRequest(req: NormalizedRequest, model: string): R
       if (part.kind === 'text') {
         if (part.text !== '') blocks.push({ type: 'text', text: part.text });
       } else if (part.kind === 'image') {
-        blocks.push({ type: 'image', source: { type: 'base64', media_type: part.mimeType === '' ? 'image/png' : part.mimeType, data: part.data } });
+        const url = splitDataUrl(part.data);
+        const mime = part.mimeType !== '' ? part.mimeType : url.mimeType !== '' ? url.mimeType : 'image/png';
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: mime, data: url.payload } });
       } else if (part.kind === 'toolCall') {
         let input: unknown = {};
         try {
@@ -395,11 +397,20 @@ export function encodeAnthropicRequest(req: NormalizedRequest, model: string): R
   return body;
 }
 
+/** A data URL split into its media type and its raw base64 payload; a bare payload passes through with no media type. */
+function splitDataUrl(value: string): { mimeType: string; payload: string } {
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(value);
+  if (match === null) return { mimeType: '', payload: value };
+  return { mimeType: match[1] ?? '', payload: match[2] ?? '' };
+}
+
 /** One Gemini content part: a text part, an inline image, or a function call. */
 function geminiPartOf(part: NormalizedPart): Record<string, unknown> | null {
   if (part.kind === 'text') return part.text === '' ? null : { text: part.text };
   if (part.kind === 'image') {
-    return { inlineData: { mimeType: part.mimeType === '' ? 'image/png' : part.mimeType, data: part.data } };
+    const url = splitDataUrl(part.data);
+    const mime = part.mimeType !== '' ? part.mimeType : url.mimeType !== '' ? url.mimeType : 'image/png';
+    return { inlineData: { mimeType: mime, data: url.payload } };
   }
   if (part.kind === 'toolCall') {
     let args: Record<string, unknown> = {};
@@ -417,7 +428,6 @@ function geminiPartOf(part: NormalizedPart): Record<string, unknown> | null {
 /** The normalized form as a Gemini generateContent body. */
 export function encodeGeminiRequest(req: NormalizedRequest, model: string): Record<string, unknown> {
   const contents: Record<string, unknown>[] = [];
-  if (req.system !== null) contents.push({ role: 'user', parts: [{ text: req.system }] });
   for (const message of req.messages) {
     const parts: Record<string, unknown>[] = [];
     for (const part of message.parts) {
@@ -436,8 +446,10 @@ export function encodeGeminiRequest(req: NormalizedRequest, model: string): Reco
   if (req.topP !== null) config.topP = req.topP;
   if (req.stopSequences.length > 0) config.stopSequences = req.stopSequences;
   if (req.jsonMode) config.responseMimeType = 'application/json';
+  const body: Record<string, unknown> = { model, contents, generationConfig: config };
+  if (req.system !== null) body.systemInstruction = { parts: [{ text: req.system }] };
   if (req.tools.length > 0) {
-    config.tools = [
+    body.tools = [
       {
         functionDeclarations: req.tools.map((tool) => ({
           name: tool.name,
@@ -447,7 +459,7 @@ export function encodeGeminiRequest(req: NormalizedRequest, model: string): Reco
       },
     ];
   }
-  return { model, contents, generationConfig: config };
+  return body;
 }
 
 /** The stop reason in the one family this aggregator reports: "stop" or "length". */
@@ -656,21 +668,21 @@ export function emitOpenAIJson(answer: NormalizedAnswer, model: string, id: stri
   };
 }
 
-/** An OpenAI event stream: role, content, finish-with-usage, then [DONE]. */
+/** An OpenAI event stream: role, content, finish-with-usage, then [DONE]. Each event is its own blank-line-terminated frame. */
 export function emitOpenAIStream(answer: NormalizedAnswer, model: string, id: string): string {
   const base = { id, object: 'chat.completion.chunk', created: 0, model };
-  const lines: string[] = [];
-  lines.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}`);
-  if (answer.text !== '') lines.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: answer.text }, finish_reason: null }] })}`);
-  lines.push(
+  const events: string[] = [];
+  events.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}`);
+  if (answer.text !== '') events.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: answer.text }, finish_reason: null }] })}`);
+  events.push(
     `data: ${JSON.stringify({
       ...base,
       choices: [{ index: 0, delta: {}, finish_reason: answer.toolCalls.length > 0 ? 'tool_calls' : 'stop' }],
       usage: { prompt_tokens: answer.usage?.prompt ?? 0, completion_tokens: answer.usage?.completion ?? 0, total_tokens: (answer.usage?.prompt ?? 0) + (answer.usage?.completion ?? 0) },
     })}`,
   );
-  lines.push('data: [DONE]');
-  return `${lines.join('\n')}\n`;
+  events.push('data: [DONE]');
+  return `${events.join('\n\n')}\n\n`;
 }
 
 /** An Anthropic response body: content blocks, then usage, then the stop reason. */
@@ -698,19 +710,19 @@ export function emitAnthropicJson(answer: NormalizedAnswer, model: string, id: s
   };
 }
 
-/** An Anthropic event stream: message_start, blocks, deltas, message_delta, message_stop. */
+/** An Anthropic event stream: message_start, blocks, deltas, message_delta, message_stop. Each event is its own blank-line-terminated frame. */
 export function emitAnthropicStream(answer: NormalizedAnswer, model: string, id: string): string {
-  const lines: string[] = [];
-  lines.push(
+  const events: string[] = [];
+  events.push(
     `event: message_start\ndata: ${JSON.stringify({
       type: 'message_start',
       message: { id, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: answer.usage?.prompt ?? 0, output_tokens: 0 } },
     })}`,
   );
   if (answer.text !== '') {
-    lines.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}`);
-    lines.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } })}`);
-    lines.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}`);
+    events.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}`);
+    events.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: answer.text } })}`);
+    events.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}`);
   }
   for (let i = 0; i < answer.toolCalls.length; i += 1) {
     const call = answer.toolCalls[i];
@@ -721,16 +733,16 @@ export function emitAnthropicStream(answer: NormalizedAnswer, model: string, id:
     } catch {
       input = {};
     }
-    lines.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: call.id === '' ? 'toolu_0' : call.id, name: call.name, input } })}`);
-    lines.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index })}`);
+    events.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: call.id === '' ? 'toolu_0' : call.id, name: call.name, input } })}`);
+    events.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index })}`);
   }
-  lines.push(
+  events.push(
     `event: message_delta\ndata: ${JSON.stringify({
       type: 'message_delta',
       delta: { stop_reason: answer.toolCalls.length > 0 ? 'tool_use' : 'end_turn', stop_sequence: null },
       usage: { output_tokens: answer.usage?.completion ?? 0 },
     })}`,
   );
-  lines.push('event: message_stop\ndata: {"type":"message_stop"}');
-  return `${lines.join('\n')}\n`;
+  events.push('event: message_stop\ndata: {"type":"message_stop"}');
+  return `${events.join('\n\n')}\n\n`;
 }
