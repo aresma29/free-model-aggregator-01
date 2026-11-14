@@ -311,6 +311,9 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify(config.catalog)}\n`);
     return;
   }
+  if (config.envUrl === '') {
+    throw new Error('MAKEFUN_ENV_URL is not set');
+  }
   const calls = new Map<string, number>();
   let requestIndex = 0;
   const server = createServer(async (req, res) => {
@@ -350,22 +353,63 @@ async function main(): Promise<void> {
       sendError(res, 502, (err as Error).message);
     }
   });
-  await new Promise<void>((resolve) => {
-    server.listen(config.port, () => resolve());
-  });
-  // The trial's register call: who this server is, on which port, with which
-  // catalog. The env URL is where the register endpoint lives.
-  const registerUrl = `${config.envUrl.replace(/\/+$/, '')}/register`;
-  try {
-    await fetch(registerUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ protocol_version: 1, port: config.port, catalog: config.catalog }),
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+  // Bind a free port on the IPv4 interface and register the port the OS
+  // actually gave us: the env's client reaches this server at the
+  // container's own address, never at a port we assume.
+  const boundPort = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '0.0.0.0', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('the server has no port'));
+        return;
+      }
+      resolve(address.port);
     });
-  } catch {
-    // A failed register is the harness's to report; the server still serves.
+  });
+  if (boundPort === 8080) {
+    throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
   }
+  // The trial's register call: who this server is, on which port, with which
+  // catalog. The env URL is where the register endpoint lives. A register
+  // that fails is a broken trial, not a serving one: fail fast.
+  const registerUrl = `${config.envUrl.replace(/\/+$/, '')}/register`;
+  const registerRes = await fetch(registerUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ protocol_version: 1, port: boundPort, catalog: config.catalog }),
+    signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+  });
+  if (!registerRes.ok) {
+    throw new Error(`POST ${registerUrl} answered HTTP ${registerRes.status}`);
+  }
+  // The trial ends when the env's work list is empty: ask it often, and
+  // leave cleanly the moment it says done, so the harness can score the
+  // run instead of waiting out the wall budget.
+  process.on('SIGTERM', () => exit(0));
+  process.on('SIGINT', () => exit(0));
+  const workUrl = `${config.envUrl.replace(/\/+$/, '')}/work`;
+  let workInFlight = false;
+  const workTimer = setInterval(() => {
+    if (workInFlight) return;
+    workInFlight = true;
+    void (async () => {
+      try {
+        const res = await fetch(workUrl, { signal: AbortSignal.timeout(2000) });
+        if (res.status !== 200) return;
+        const work: unknown = await res.json();
+        if (isRecord(work) && work.done === true) {
+          clearInterval(workTimer);
+          server.close();
+          exit(0);
+        }
+      } catch {
+        // The env is not reachable yet: try again on the next tick.
+      } finally {
+        workInFlight = false;
+      }
+    })();
+  }, 250);
 }
 
 main().catch((err: unknown) => {
